@@ -41,3 +41,11 @@ class NodeClient:
 
     def get_wallet(self, address: str) -> dict:
         return self._call("GET", f"/wallets/{address}")
+
+
+    def get_block(self, index: int) -> dict:
+        return self._call("GET", f"/blocks/{index}")
+
+
+    def get_blocks_from(self, index: int) -> list[dict]:
+        return self._call("GET", f"/blocks/from/{index}")["blocks"]

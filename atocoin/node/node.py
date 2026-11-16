@@ -10,10 +10,14 @@ from ..crypto import is_valid_address
 from ..net import normalize_url, request_json
 from ..wallet_registration import verify_wallet_registration
 
+from .block import Block
+from .blockchain import Blockchain
 from .peers import PeerRegistry
 from .server import make_server
 
 log = logging.getLogger("atocoin.node")
+
+MAX_BLOCKS_PER_REQUEST = 100
 
 
 class ApiError(Exception):
@@ -35,12 +39,15 @@ class Node:
         heartbeat_interval: float | None = 10.0,
         request_timeout: float = 3.0,
         max_peers: int = 100,
+        miner_address: str | None = None,
+        block_interval: float = 10.0,
     ):
         self.node_id = uuid.uuid4().hex
         self.host = host
         self.port = port
-        if advertise_host == None:
-            self.advertise_host = host
+        if advertise_host is None:
+            advertise_host = host
+        self.advertise_host = advertise_host
         self.seeds = []
         for s in seeds:
             self.seeds.append(normalize_url(s))
@@ -48,13 +55,23 @@ class Node:
         self.request_timeout = request_timeout
         self.max_peers = max_peers
 
+        if miner_address is not None and not is_valid_address(miner_address):
+            raise ValueError("Invalid miner address")
+        if block_interval <= 0:
+            raise ValueError("Block interval needs to be positive")
+        self.miner_address = miner_address
+        self.block_interval = block_interval
+
         self.peers = PeerRegistry(self.node_id, max_peers=max_peers)
+        self.blockchain = Blockchain()
         self._wallets: dict[str, dict] = {}
         self._wallets_lock = threading.Lock()
+        self._sync_lock = threading.Lock()
 
         self._server = None
         self._server_thread: threading.Thread | None = None
         self._heartbeat_thread: threading.Thread | None = None
+        self._mining_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self.started_at: float | None = None
 
@@ -82,6 +99,7 @@ class Node:
         log.info(f"Node {self.node_id} listening on {self.url}")
 
         self._retry_seeds()
+        self.sync_chain()
 
         if self.heartbeat_interval:
             self._heartbeat_thread = threading.Thread(
@@ -90,6 +108,15 @@ class Node:
                 daemon=True
             )
             self._heartbeat_thread.start()
+
+        if self.miner_address is not None:
+            self._mining_thread = threading.Thread(
+                target=self._mining_loop,
+                name=f"node-mining-{self.port}",
+                daemon=True,
+            )
+            self._mining_thread.start()
+            log.info(f"Mining a block every {self.block_interval}s for {self.miner_address}")
 
 
     def stop(self) -> None:
@@ -104,6 +131,10 @@ class Node:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=self.request_timeout + 2)
             self._heartbeat_thread = None
+
+        if self._mining_thread is not None:
+            self._mining_thread.join(timeout=self.request_timeout + 2)
+            self._mining_thread = None
         self._server = None
         log.info(f"Node {self.node_id} stopped", )
 
@@ -129,6 +160,8 @@ class Node:
             "uptime_seconds": round(uptime, 1),
             "peers_count": len(self.peers),
             "wallets_count": wallets_count,
+            "blocks_count": len(self.blockchain),
+            "last_block_hash": self.blockchain.last_block.hash,
         }
 
 
@@ -153,6 +186,7 @@ class Node:
             ("POST", "/peers/register"): lambda: self._api_register_peer(body),
             ("GET", "/wallets"): lambda: (200, {"wallets": self._list_wallets()}),
             ("POST", "/wallets/register"): lambda: self._api_register_wallet(body),
+            ("POST", "/blocks/new"): lambda: self._api_new_block(body),
         }
 
         func = routes.get((method, path))
@@ -161,6 +195,12 @@ class Node:
         
         if method == "GET" and path.startswith("/wallets/"):
             return self._api_get_wallet(path[len("/wallets/"):])
+
+        if method == "GET" and path.startswith("/blocks/from/"):
+            return self._api_get_blocks_from(path[len("/blocks/from/"):])
+
+        if method == "GET" and path.startswith("/blocks/"):
+            return self._api_get_block(path[len("/blocks/"):])
         
         raise ApiError(404, f"Wrong path or method - {path} {method}")
 
@@ -250,7 +290,7 @@ class Node:
             start = normalize_url(url)
         except ValueError as e:
             log.warning(f"Invalid url: {url}: {e}")
-            return False
+            return
 
         queue = deque([start])
         visited = set()
@@ -258,8 +298,8 @@ class Node:
             target = queue.popleft()
             try:
                 target = normalize_url(target)
-            except ValueError:
-                log.warning(f"Invalid url: {url}: {e}")
+            except ValueError as e:
+                log.warning(f"Invalid url: {target}: {e}")
                 continue
 
             if target in visited or target == self.url:
@@ -322,6 +362,116 @@ class Node:
         return 200, wallet
     
 
+    # blocks
+    def _parse_index(self, text: str) -> int:
+        if not text.isascii() or not text.isdigit() or len(text) > 12:
+            raise ApiError(400, "Invalid block index")
+        return int(text)
+
+
+    def _api_get_block(self, text: str) -> tuple[int, dict]:
+        index = self._parse_index(text)
+        block = self.blockchain.get_block(index)
+        if block is None:
+            raise ApiError(404, "Block not found")
+        return 200, block.to_dict()
+
+
+    def _api_get_blocks_from(self, text: str) -> tuple[int, dict]:
+        start = self._parse_index(text)
+        blocks = self.blockchain.get_blocks_from(start, MAX_BLOCKS_PER_REQUEST)
+        return 200, {"blocks": [b.to_dict() for b in blocks]}
+
+
+    def _api_new_block(self, body: dict) -> tuple[int, dict]:
+        try:
+            block = Block.from_dict(body)
+        except ValueError as e:
+            raise ApiError(400, f"Invalid block: {e}")
+
+        if block.index > len(self.blockchain):
+            threading.Thread(target=self.sync_chain, daemon=True).start()
+            raise ApiError(409, "Block is ahead of our chain, syncing")
+
+        try:
+            is_new = self.blockchain.add_block(block)
+        except ValueError as e:
+            raise ApiError(400, f"Invalid block: {e}")
+
+        blocks_count = len(self.blockchain)
+        if not is_new:
+            return 200, {"accepted": False, "blocks_count": blocks_count}
+
+        log.info(f"Accepted block {block.index} {block.hash}")
+        threading.Thread(target=self._broadcast_block, args=(block,), daemon=True).start()
+        return 201, {"accepted": True, "blocks_count": blocks_count}
+
+
+    def _broadcast_block(self, block: Block) -> None:
+        body = block.to_dict()
+        for peer in self.peers.snapshot():
+            try:
+                status, data = request_json(
+                    "POST", f"{peer.url}/blocks/new", body, timeout=self.request_timeout
+                )
+            except RuntimeError as e:
+                log.warning(f"Can't send block {block.index} to {peer.url}: {e}")
+                continue
+
+            if status not in (200, 201):
+                reason = data.get("error") if isinstance(data, dict) else data
+                log.debug(f"Peer {peer.url} didn't accept block {block.index} ({status}): {reason}")
+
+
+    def sync_chain(self) -> None:
+        if not self._sync_lock.acquire(blocking=False):
+            return
+
+        try:
+            for peer in self.peers.snapshot():
+                self._sync_with_peer(peer)
+        finally:
+            self._sync_lock.release()
+
+
+    def _sync_with_peer(self, peer) -> None:
+        while True:
+            start = len(self.blockchain)
+            try:
+                status, data = request_json(
+                    "GET", f"{peer.url}/blocks/from/{start}", timeout=self.request_timeout
+                )
+            except RuntimeError as e:
+                log.warning(f"Can't sync with {peer.url}: {e}")
+                return
+
+            if status != 200 or not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
+                log.warning(f"Peer {peer.url} sent an invalid blocks response ({status})")
+                return
+
+            for raw_block in data["blocks"]:
+                try:
+                    block = Block.from_dict(raw_block)
+                    if self.blockchain.add_block(block):
+                        log.info(f"Synced block {block.index} {block.hash} from {peer.url}")
+                except ValueError as e:
+                    log.warning(f"Peer {peer.url} sent an invalid block: {e}")
+                    return
+
+            if len(self.blockchain) == start:
+                return
+
+
+    def _mining_loop(self) -> None:
+        while not self._stop_event.wait(self.block_interval):
+            try:
+                block = self.blockchain.mine_block(self.miner_address)
+                log.info(f"Mined block {block.index} {block.hash}")
+                self._broadcast_block(block)
+            except Exception as e:
+                log.exception(f"Mining error: {e}")
+
+
     # Heartbeat
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.wait(self.heartbeat_interval):
@@ -336,6 +486,7 @@ class Node:
             self._check_peer(peer)
         self._exchange_peers()
         self._retry_seeds()
+        self.sync_chain()
 
 
     def _check_peer(self, peer) -> None:

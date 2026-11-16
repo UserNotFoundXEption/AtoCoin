@@ -17,6 +17,8 @@ def main(argv=None) -> int:
     parser.add_argument("--advertise-host")
     parser.add_argument("--seed", action="append", default=[])
     parser.add_argument("--heartbeat", type=float, default=10.0)
+    parser.add_argument("--miner-address")
+    parser.add_argument("--block-interval", type=float, default=10.0)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
 
@@ -31,6 +33,8 @@ def main(argv=None) -> int:
             advertise_host=args.advertise_host,
             seeds=args.seed,
             heartbeat_interval=args.heartbeat,
+            miner_address=args.miner_address,
+            block_interval=args.block_interval,
         )
         node.start()
     except (OSError, ValueError) as e:
@@ -42,6 +46,8 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, _terminate)
 
     print(f"Node started: {node.url}  (node_id: {node.node_id})", flush=True)
+    if node.miner_address is not None:
+        print(f"Mining a block every {node.block_interval}s for {node.miner_address}", flush=True)
 
     try:
         while True:

@@ -43,7 +43,8 @@ def main() -> None:
             print(f"Node info:          {node_info}")
             print(f"Registeration:      {wallet.register_with_node(client)}")
             print(f"Again:              {wallet.register_with_node(client)}")
-            print(f"Get wallet as node: {client.get_wallet(wallet.address)["address"]}")
+            bububu = client.get_wallet(wallet.address)["address"]
+            print(f"Get wallet as node: {bububu}")
 
             print("\n4. Signature forgery attempt")
             victim = KeyPair.generate()
@@ -57,8 +58,10 @@ def main() -> None:
 
             print("\n5. Signature")
             signature = wallet.sign(b"hello")
-            print(f"Ok?:                {verify(bytes.fromhex(wallet.public_key), b"hello", bytes.fromhex(signature))}")
-            print(f"Forged message ok?: {verify(bytes.fromhex(wallet.public_key), b"not hello :(", bytes.fromhex(signature))}")
+            v1 = verify(bytes.fromhex(wallet.public_key), b"hello", bytes.fromhex(signature))
+            print(f"Ok?:                {v1}")
+            v2 = verify(bytes.fromhex(wallet.public_key), b"not hello :(", bytes.fromhex(signature))
+            print(f"Forged message ok?: {v2}")
         finally:
             for node in (c, b, a):
                 node.stop()

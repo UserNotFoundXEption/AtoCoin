@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import sys
+import time
 from pathlib import Path
 
 from ..crypto import PUBLIC_KEY_SIZE, SIGNATURE_SIZE, parse_hex, verify
@@ -68,6 +70,25 @@ def cmd_register(args) -> None:
     print(f"Wallet {result['address']} {state} in node {args.node}")
 
 
+def cmd_blocks(args) -> None:
+    client = NodeClient(args.node)
+    start = 0
+    while True:
+        blocks = client.get_blocks_from(start)
+        if not blocks:
+            break
+
+        for block in blocks:
+            created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(block["timestamp"]))
+            print(f"{block['index']:>5}  {created}  {block['hash']}  {block['miner']}")
+        start = blocks[-1]["index"] + 1
+
+
+def cmd_block(args) -> None:
+    block = NodeClient(args.node).get_block(args.index)
+    print(json.dumps(block, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wallet", type=Path, default=Path(DEFAULT_WALLET_PATH))
@@ -90,10 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
         ("node-info", cmd_node_info),
         ("peers", cmd_peers),
         ("register", cmd_register),
+        ("blocks", cmd_blocks),
     ):
         p = sub.add_parser(name)
         p.add_argument("--node", default="http://127.0.0.1:5000")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("block")
+    p.add_argument("index", type=int)
+    p.add_argument("--node", default="http://127.0.0.1:5000")
+    p.set_defaults(func=cmd_block)
     return parser
 
 
@@ -101,7 +128,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except (RuntimeError, NodeError, ValueError, OSError) as e:
+    except (RuntimeError, RuntimeWarning, NodeError, ValueError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     return 0
